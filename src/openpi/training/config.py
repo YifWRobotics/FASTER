@@ -8,8 +8,10 @@ import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
+import einops
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -562,6 +564,180 @@ class LeRobotCalvinDataConfig(DataConfigFactory):
             action_sequence_keys=action_sequence_keys,
             use_quantile_norm=False,
         )
+
+
+###### Tactile Yogaball (ported from openpi-IsaacLab for FASTER fine-tune) ######
+
+# Precomputed viridis LUT (256 entries × 3 uint8). Built lazily on first use.
+_VIRIDIS_LUT: np.ndarray | None = None
+
+
+def _viridis_lut() -> np.ndarray:
+    global _VIRIDIS_LUT
+    if _VIRIDIS_LUT is None:
+        import matplotlib.cm
+
+        ramp = np.linspace(0.0, 1.0, 256)
+        rgba = matplotlib.cm.viridis(ramp)
+        _VIRIDIS_LUT = (rgba[:, :3] * 255.0).astype(np.uint8)
+    return _VIRIDIS_LUT
+
+
+_TACTILE_TARGET_SIZE = 224  # matches ResizeImages target in ModelTransformFactory
+
+
+def _tactile_grey_to_viridis(img: np.ndarray) -> np.ndarray:
+    """Tactile (H,W,3) uint8 channel-replicated grey → viridis pseudo-color (224,224,3) uint8.
+
+    Two design choices, validated by a separate research pass:
+
+    1. **Luma extraction** (BT.601 Y = 0.299R + 0.587G + 0.114B), not channel 0.
+       The dataset writes grey replicated across R=G=B before h264 encoding, but
+       4:2:0 chroma subsampling on these tiny grids (11x17, 20x8) means decoded
+       R/G/B drift by 1-3 codes near edges. Luma collapses that drift back into
+       the original scalar.
+
+    2. **Resize-then-colormap**, not colormap-then-resize.
+       Bilinear interpolation of viridis triplets traces a *chord* across the
+       colormap curve, producing off-manifold colors SigLIP has never seen.
+       Resizing the scalar luma first and applying the LUT after keeps every
+       output color exactly on the viridis manifold.
+
+    The resize-and-pad geometry mirrors `image_tools.resize_with_pad`: longer
+    side scales to 224, shorter side scales proportionally, the rest is padded
+    with black `(0,0,0)` *after* the LUT (so padding is true-black, not
+    viridis(0) = deep purple).
+
+    Returns (224, 224, 3) uint8, so downstream ResizeImages(224, 224) is a no-op.
+
+    SigLIP responds better to colormap-encoded scalar fields than flat replicated
+    greys (PseudoColorViT-Alz, arXiv:2512.16964). Viridis is perceptually uniform
+    with monotonic luminance, so contact magnitude maps to a hue the encoder can
+    latch onto without breaking its color-space prior.
+    """
+    import cv2
+
+    img = np.asarray(img)
+    if np.issubdtype(img.dtype, np.floating):
+        img = (255 * img).astype(np.uint8)
+    if img.shape[0] == 3:
+        img = einops.rearrange(img, "c h w -> h w c")
+
+    rgb = img.astype(np.float32)
+    luma = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+
+    h, w = luma.shape
+    target = _TACTILE_TARGET_SIZE
+    ratio = max(w / target, h / target)
+    resized_h = max(1, int(round(h / ratio)))
+    resized_w = max(1, int(round(w / ratio)))
+    luma_resized = cv2.resize(luma, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+    luma_u8 = np.clip(np.round(luma_resized), 0, 255).astype(np.uint8)
+    color = _viridis_lut()[luma_u8]  # (resized_h, resized_w, 3) uint8
+
+    pad_h0, rem_h = divmod(target - resized_h, 2)
+    pad_h1 = pad_h0 + rem_h
+    pad_w0, rem_w = divmod(target - resized_w, 2)
+    pad_w1 = pad_w0 + rem_w
+    return np.pad(color, ((pad_h0, pad_h1), (pad_w0, pad_w1), (0, 0)), constant_values=0)
+
+
+@dataclasses.dataclass(frozen=True)
+class TactileYogaballGreyInputs(_transforms.DataTransformFn):
+    """Adapter for the 50 Hz greyscale-tactile yogaball dataset
+    (yogaball_2026-04-25_combined_lerobot).
+
+    Dataset columns (all already in lerobot v2.1 layout):
+        observation.images.chest_tactile : video (11, 17, 3) uint8 — channel-replicated grey
+        observation.images.left_tactile  : video (20,  8, 3) uint8 — channel-replicated grey
+        observation.images.right_tactile : video (20,  8, 3) uint8 — channel-replicated grey
+        observation.state                : (18,) float32 — left+right hand pose
+        action                           : (18,) float32 — left+right hand pose target
+
+    Each tactile slot is recolored from grey to viridis before being routed to
+    the SigLIP image slots. Chest goes to base, left/right to wrist slots.
+
+    FASTER passthrough: when the deploy-time client sends `action_prefix` and
+    `delay` kwargs (Track 4 — `full_openpi05_yogaball_async_faster_eval_pub.py`),
+    propagate them so the model's prefix conditioning takes effect. Mirrors the
+    pattern in `inference/agilex_policy.py:84-88`.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        chest = _tactile_grey_to_viridis(data["observation.images.chest_tactile"])
+        left = _tactile_grey_to_viridis(data["observation.images.left_tactile"])
+        right = _tactile_grey_to_viridis(data["observation.images.right_tactile"])
+
+        inputs = {
+            "state": np.asarray(data["observation.state"]),
+            "image": {
+                "base_0_rgb": chest,
+                "left_wrist_0_rgb": left,
+                "right_wrist_0_rgb": right,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            },
+        }
+
+        if "actions" in data:
+            inputs["actions"] = np.asarray(data["actions"])
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+        # FASTER deploy-time RTC: prefix + delay come from the broker.
+        if "delay" in data:
+            inputs["delay"] = data["delay"]
+        if "action_prefix" in data:
+            inputs["action_prefix"] = data["action_prefix"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class TactileYogaballGreyOutputs(_transforms.DataTransformFn):
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, :18])}
+
+
+@dataclasses.dataclass(frozen=True)
+class TactileYogaballGreyDataConfig(DataConfigFactory):
+    default_prompt: str | None = "interact with the yoga ball"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.chest_tactile": "observation.images.chest_tactile",
+                        "observation.images.left_tactile": "observation.images.left_tactile",
+                        "observation.images.right_tactile": "observation.images.right_tactile",
+                        "observation.state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[TactileYogaballGreyInputs()],
+            outputs=[TactileYogaballGreyOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+###### End Tactile Yogaball ######
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1139,6 +1315,50 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=50_000,
         save_interval=10_000,
+    ),
+    #
+    # FASTER yogaball — full fine-tune on the 50 Hz greyscale-tactile yogaball
+    # dataset. Inits from our existing yogaball pi0.5 checkpoint to preserve
+    # task knowledge; FASTER's mixed HAS+const training teaches the model to
+    # interpret prefix tokens at t=0 as "clean past" (per-token timesteps),
+    # which is the architectural feature missing from the vanilla pi0.5
+    # checkpoint that caused deployment-time hard inpainting (Track 3 Exp 5)
+    # to fail at 17 mm boundary on this checkpoint. max_delay=18 is chosen
+    # from Phase-B latency analysis of the async deploy regime (observed
+    # new_delay 12-15, +3 safety) — see locomanip_deploy/.../docs/
+    # rtc_async_experiment_log.md for the empirical justification.
+    #
+    TrainConfig(
+        name="pi05_faster_yogaball_grey",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_delay=18,
+            mix_prob=0.5,
+            alpha=0.6,
+            u0=0.9,
+        ),
+        data=TactileYogaballGreyDataConfig(
+            repo_id="yogaball_2026-04-25_combined_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="interact with the yoga ball",
+        ),
+        # TODO: set HPC checkpoint path before training. Replace
+        # <HPC_CHECKPOINT_PATH> with the absolute path to where the existing
+        # yogaball pi0.5 checkpoint params live on the HPC filesystem after
+        # rsync (the local path is /home/yifan/Robotics/openpi-IsaacLab/
+        # checkpoints/May4-pi-05-Yogaball-Training-50hz-April26Data/params).
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "<HPC_CHECKPOINT_PATH>/May4-pi-05-Yogaball-Training-50hz-April26Data/params"
+        ),
+        num_train_steps=30_000,
+        batch_size=128,
+        num_workers=8,
+        save_interval=5_000,
     ),
     #
     # Debugging configs.
