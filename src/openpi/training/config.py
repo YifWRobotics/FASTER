@@ -1343,22 +1343,20 @@ _CONFIGS = [
             u0=0.9,
         ),
         data=TactileYogaballGreyDataConfig(
-            repo_id="yogaball_2026-04-25_combined_lerobot",
+            repo_id="YifWRobotics/May4-pi-05-Yogaball-Training-50hz-April26Data",
             base_config=DataConfig(prompt_from_task=False),
             default_prompt="interact with the yoga ball",
         ),
-        # TODO: set HPC checkpoint path before training. Replace
-        # <HPC_CHECKPOINT_PATH> with the absolute path to where the existing
-        # yogaball pi0.5 checkpoint params live on the HPC filesystem after
-        # rsync (the local path is /home/yifan/Robotics/openpi-IsaacLab/
-        # checkpoints/May4-pi-05-Yogaball-Training-50hz-April26Data/params).
+        # Init from the public pi0.5 base checkpoint. Requires
+        # HF_LEROBOT_HOME=/home/ara/repos/FASTER/data so the repo_id above
+        # resolves to data/YifWRobotics/May4-pi-05-Yogaball-Training-50hz-April26Data.
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "<HPC_CHECKPOINT_PATH>/May4-pi-05-Yogaball-Training-50hz-April26Data/params"
+            "gs://openpi-assets/checkpoints/pi05_base/params"
         ),
-        num_train_steps=30_000,
+        num_train_steps=10_000,
         batch_size=128,
         num_workers=8,
-        save_interval=5_000,
+        save_interval=1_000,
     ),
     #
     # Debugging configs.
