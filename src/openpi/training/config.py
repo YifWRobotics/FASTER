@@ -1359,6 +1359,106 @@ _CONFIGS = [
         save_interval=1_000,
     ),
     #
+    # FASTER bucket — 25 Hz greyscale-tactile bucket teleop dataset
+    # (0509_bucket_teleop_25hz_lerobot). Same robot, same sensors, same
+    # 18-D state/action layout as yogaball; reuses TactileYogaballGreyDataConfig.
+    # max_delay=10 follows the FASTER paper default — at 25 Hz that is 400 ms
+    # of latency budget, matching the empirical ~200-300 ms inference latency
+    # observed at deploy.
+    #
+    TrainConfig(
+        name="pi05_faster_bucket_grey",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_delay=10,
+            mix_prob=0.5,
+            alpha=0.6,
+            u0=0.9,
+        ),
+        data=TactileYogaballGreyDataConfig(
+            repo_id="YifWRobotics/0509_bucket_teleop_25hz_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="interact with the bucket",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=8_000,
+        batch_size=128,
+        num_workers=8,
+        save_interval=2_000,
+    ),
+    #
+    # FASTER pillow — 25 Hz greyscale-tactile pillow teleop dataset
+    # (0509_pillow_teleop_25hz_lerobot). Mirror of the bucket config; same
+    # robot/sensors/layout, just a different task.
+    #
+    TrainConfig(
+        name="pi05_faster_pillow_grey",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_delay=10,
+            mix_prob=0.5,
+            alpha=0.6,
+            u0=0.9,
+        ),
+        data=TactileYogaballGreyDataConfig(
+            repo_id="YifWRobotics/0509_pillow_teleop_25hz_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="interact with the pillow",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=8_000,
+        batch_size=128,
+        num_workers=8,
+        save_interval=2_000,
+    ),
+    #
+    # FASTER yogaball 25 Hz — downsampled-to-25Hz version of the original
+    # yogaball dataset (yogaball_2026-04-25_combined_25hz_lerobot). Same task
+    # and recording campaign as the 50Hz config, but trained at 25Hz to match
+    # the bucket / pillow deploy regime (max_delay=10 → 400 ms latency budget).
+    #
+    TrainConfig(
+        name="pi05_faster_yogaball_25hz_grey",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_delay=10,
+            mix_prob=0.5,
+            alpha=0.6,
+            u0=0.9,
+        ),
+        data=TactileYogaballGreyDataConfig(
+            repo_id="YifWRobotics/yogaball_2026-04-25_combined_25hz_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="interact with the yoga ball",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=8_000,
+        batch_size=128,
+        num_workers=8,
+        save_interval=2_000,
+    ),
+    #
     # Debugging configs.
     #
     TrainConfig(
