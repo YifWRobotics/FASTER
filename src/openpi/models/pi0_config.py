@@ -132,6 +132,25 @@ class Pi0FasterConfig(_model.BaseModelConfig):
     alpha: float = 0.6
     u0: float = 0.9
 
+    # Auxiliary force-prediction head (mirrors tactile-diffusion ViT-FMT/DiT).
+    # When `force_head_enabled` is False (default), no force_head submodule is
+    # created and existing pretrained Pi0.5 checkpoints load unchanged.
+    force_head_enabled: bool = False
+    force_head_dim: int = 2
+    force_head_pool_mode: str = "per_step_attn"  # "mean" | "last" | "per_step_attn"
+    force_head_n_layers: int = 2
+    force_head_n_heads: int = 4
+    force_head_softplus: bool = True
+    force_head_loss_type: str = "smooth_l1"  # "mse" | "smooth_l1"
+    force_loss_weight: float = 1.0
+    # When True, the force head receives observation.state as an extra
+    # projected token prepended to its cross-attention memory. Required for
+    # pi05+discrete_state_input=False because the LLM does not otherwise see
+    # the proprio (state is neither tokenized into the prompt nor added to
+    # the suffix). The new state projection lives under force_head/state_proj/*
+    # so it stays inside the namespace covered by missing_regex.
+    force_head_use_state: bool = True
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -156,6 +175,12 @@ class Pi0FasterConfig(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        force_target_spec = (
+            jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.force_head_dim], jnp.float32)
+            if self.force_head_enabled
+            else None
+        )
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={
@@ -171,6 +196,7 @@ class Pi0FasterConfig(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                force_target=force_target_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

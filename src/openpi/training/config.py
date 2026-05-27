@@ -737,6 +737,131 @@ class TactileYogaballGreyDataConfig(DataConfigFactory):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class TactileForceInputs(_transforms.DataTransformFn):
+    """Adapter for the force-instrumented tactile datasets
+    (mixed_{yogaball,bucket,pillow}_force_25hz_lerobot).
+
+    Dataset columns:
+        observation.images.*  : same three tactile streams as TactileYogaballGreyInputs.
+        observation.state     : (20,) float32 — first 18 = [left_pose9, right_pose9],
+                                last 2 = [right_force, left_force] in Newtons.
+        action                : (18,) float32 — pure pose target (no force).
+
+    Expects ``observation.state`` to be requested as a 50-step sequence
+    (see ``TactileForceDataConfig.action_sequence_keys``), so the raw value
+    arrives shaped (50, 20). The first 18 dims of the CURRENT frame go to the
+    model as the proprio state input (matching the 18-dim convention used by
+    the existing TactileYogaballGreyInputs path so pretrained Pi0.5 weights
+    behave identically). The last 2 dims across all 50 steps become
+    ``force_target`` for the auxiliary force-prediction head.
+
+    Force normalization (borrows the ViT-FMT/DiT *20 N cap convention*, NOT
+    its normalization mechanism): we cap raw Newtons at ``force_cap`` and
+    divide, so ``force_target`` lives in [0, 1]. This keeps the loss scale
+    comparable to the action loss (force_loss_weight=1.0 is sane). ViT-FMT/DiT
+    instead fits force_target with its policy LinearNormalizer and applies
+    softplus in physical Newton space (unnormalize -> softplus -> re-normalize
+    for the loss); that requires the model to hold the normalizer's stats,
+    which FASTER's pipeline does not. We avoid routing force_target through
+    openpi's quantile normalizer because zero force would map near -1 while
+    softplus(pred) is always > 0, making low-force targets structurally
+    impossible to fit. Note: softplus is non-negative but unbounded, and
+    softplus(0) ~= 0.693 -- see FORCE_HEAD.md "Force normalization" for the
+    detailed caveats.
+    """
+
+    force_cap: float = 20.0
+
+    def __call__(self, data: dict) -> dict:
+        chest = _tactile_grey_to_viridis(data["observation.images.chest_tactile"])
+        left = _tactile_grey_to_viridis(data["observation.images.left_tactile"])
+        right = _tactile_grey_to_viridis(data["observation.images.right_tactile"])
+
+        state_seq = np.asarray(data["observation.state"])  # (50, 20) sequenced
+        if state_seq.ndim != 2 or state_seq.shape[-1] != 20:
+            raise ValueError(
+                f"TactileForceInputs expects sequenced observation.state with shape (50, 20); "
+                f"got {state_seq.shape}. Make sure 'observation.state' is in action_sequence_keys."
+            )
+        current_pose = state_seq[0, :18]                   # (18,)
+        force_raw = state_seq[:, 18:20].astype(np.float32)  # (50, 2) in Newtons
+        force_target = np.clip(force_raw, 0.0, self.force_cap) / self.force_cap  # (50, 2) in [0, 1]
+
+        inputs = {
+            "state": current_pose,
+            "force_target": force_target,
+            "image": {
+                "base_0_rgb": chest,
+                "left_wrist_0_rgb": left,
+                "right_wrist_0_rgb": right,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            },
+        }
+
+        if "actions" in data:
+            inputs["actions"] = np.asarray(data["actions"])
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+        if "delay" in data:
+            inputs["delay"] = data["delay"]
+        if "action_prefix" in data:
+            inputs["action_prefix"] = data["action_prefix"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class TactileForceDataConfig(DataConfigFactory):
+    """DataConfig for the force-instrumented tactile datasets. Sequences
+    ``observation.state`` alongside ``action`` so the inputs transform can
+    extract a per-step force trajectory across the action horizon.
+
+    ``force_cap`` (default 20 N) is the saturation point used to scale
+    force into [0, 1] before training (see ``TactileForceInputs``).
+    """
+
+    default_prompt: str | None = "interact with the object"
+    force_cap: float = 20.0
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.chest_tactile": "observation.images.chest_tactile",
+                        "observation.images.left_tactile": "observation.images.left_tactile",
+                        "observation.images.right_tactile": "observation.images.right_tactile",
+                        "observation.state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[TactileForceInputs(force_cap=self.force_cap)],
+            outputs=[TactileYogaballGreyOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # IMPORTANT: observation.state is sequenced too, so TactileForceInputs
+            # can extract the per-step force trajectory from state[:, 18:20].
+            action_sequence_keys=("action", "observation.state"),
+        )
+
+
 ###### End Tactile Yogaball ######
 
 
@@ -1394,6 +1519,49 @@ _CONFIGS = [
         save_interval=2_000,
     ),
     #
+    # FASTER bucket 25 Hz + force head — independent training of the 25 Hz
+    # bucket dataset with the auxiliary cross-attention force-prediction head.
+    # Pretrained pi05_base backbone loads as-is; only force_head/* starts random.
+    # Does NOT share state with the existing bucket training. The dataset must
+    # emit observation["force_target"] with shape (b, 50, 2).
+    #
+    TrainConfig(
+        name="pi05_faster_bucket_grey_force",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_delay=10,
+            mix_prob=0.5,
+            alpha=0.6,
+            u0=0.9,
+            force_head_enabled=True,
+            force_head_dim=2,
+            force_head_pool_mode="per_step_attn",
+            force_head_n_layers=2,
+            force_head_n_heads=4,
+            force_head_softplus=True,
+            force_head_loss_type="smooth_l1",
+            force_loss_weight=1.0,
+        ),
+        data=TactileForceDataConfig(
+            repo_id="mixed_bucket_force_25hz_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="interact with the bucket",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=r"force_head/.*",
+        ),
+        num_train_steps=8_000,
+        batch_size=128,
+        num_workers=8,
+        save_interval=2_000,
+    ),
+    #
     # FASTER pillow — 25 Hz greyscale-tactile pillow teleop dataset
     # (0509_pillow_teleop_25hz_lerobot). Mirror of the bucket config; same
     # robot/sensors/layout, just a different task.
@@ -1419,6 +1587,49 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=8_000,
+        batch_size=128,
+        num_workers=8,
+        save_interval=2_000,
+    ),
+    #
+    # FASTER pillow 25 Hz + force head — independent training of the 25 Hz
+    # pillow dataset with the auxiliary cross-attention force-prediction head.
+    # Pretrained pi05_base backbone loads as-is; only force_head/* starts random.
+    # Does NOT share state with the existing pillow training. The dataset must
+    # emit observation["force_target"] with shape (b, 50, 2).
+    #
+    TrainConfig(
+        name="pi05_faster_pillow_grey_force",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_delay=10,
+            mix_prob=0.5,
+            alpha=0.6,
+            u0=0.9,
+            force_head_enabled=True,
+            force_head_dim=2,
+            force_head_pool_mode="per_step_attn",
+            force_head_n_layers=2,
+            force_head_n_heads=4,
+            force_head_softplus=True,
+            force_head_loss_type="smooth_l1",
+            force_loss_weight=1.0,
+        ),
+        data=TactileForceDataConfig(
+            repo_id="mixed_pillow_force_25hz_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="interact with the pillow",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=r"force_head/.*",
         ),
         num_train_steps=8_000,
         batch_size=128,
@@ -1452,6 +1663,51 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=8_000,
+        batch_size=128,
+        num_workers=8,
+        save_interval=2_000,
+    ),
+    #
+    # FASTER yogaball 25 Hz + force head — independent training of the 25 Hz
+    # yogaball dataset with the auxiliary cross-attention force-prediction head
+    # (mirrors ViT-FMT / ViT-DiT in tactile_diffusion). Pretrained pi05_base
+    # backbone loads as-is; only force_head/* starts random. Does NOT share
+    # state with any existing yogaball training — different run name, dataset
+    # access is read-only via repo_id. The dataset must emit
+    # observation["force_target"] with shape (b, 50, 2).
+    #
+    TrainConfig(
+        name="pi05_faster_yogaball_25hz_grey_force",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_delay=10,
+            mix_prob=0.5,
+            alpha=0.6,
+            u0=0.9,
+            force_head_enabled=True,
+            force_head_dim=2,
+            force_head_pool_mode="per_step_attn",
+            force_head_n_layers=2,
+            force_head_n_heads=4,
+            force_head_softplus=True,
+            force_head_loss_type="smooth_l1",
+            force_loss_weight=1.0,
+        ),
+        data=TactileForceDataConfig(
+            repo_id="mixed_yogaball_force_25hz_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="interact with the yoga ball",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=r"force_head/.*",
         ),
         num_train_steps=8_000,
         batch_size=128,

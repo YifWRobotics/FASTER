@@ -10,6 +10,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models import force_head as _force_head
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -98,6 +99,54 @@ class Pi0Faster(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        # ── Auxiliary force-prediction head (mirrors tactile-diffusion ViT-FMT/DiT) ──
+        # When `force_head_enabled=False`, no submodule is created and existing
+        # pretrained Pi0.5 checkpoints load unchanged. When True, a new module
+        # tree under `force_head/*` is added (random init). The
+        # `CheckpointWeightLoader.missing_regex` must be set accordingly so the
+        # weight loader allows those new keys to be missing from the checkpoint.
+        self.force_head_enabled = bool(config.force_head_enabled)
+        self.force_head_dim = config.force_head_dim
+        self.force_head_pool_mode = config.force_head_pool_mode
+        self.force_head_softplus = bool(config.force_head_softplus)
+        self.force_head_loss_type = config.force_head_loss_type
+        self.force_loss_weight = float(config.force_loss_weight)
+        if self.force_head_enabled:
+            if self.force_head_pool_mode not in _force_head.VALID_POOL_MODES:
+                raise ValueError(
+                    f"force_head_pool_mode must be one of {_force_head.VALID_POOL_MODES}, "
+                    f"got {self.force_head_pool_mode!r}"
+                )
+            if self.force_head_loss_type not in _force_head.VALID_LOSS_TYPES:
+                raise ValueError(
+                    f"force_head_loss_type must be one of {_force_head.VALID_LOSS_TYPES}, "
+                    f"got {self.force_head_loss_type!r}"
+                )
+            # Read from prefix_out (clean obs conditioning) — same memory source
+            # ViT-FMT/DiT use. Prefix tokens (image + text) do not attend
+            # to suffix tokens (noisy actions + time + adaRMS), so prefix_out is
+            # uncontaminated by the diffusion noise schedule. Width is
+            # paligemma_config.width (2048 for gemma_2b), NOT
+            # action_expert_config.width (1024 for gemma_300m).
+            # Note: in pi05+discrete_state_input=False the LLM does NOT see the
+            # proprio state — state is neither tokenized into the prompt
+            # (TokenizePrompt skips it) nor added to the suffix (the state_proj
+            # branch in embed_suffix runs only when not self.pi05). So we feed
+            # observation.state directly into the force head via state_dim,
+            # which prepends a projected state token to the cross-attention
+            # memory. All new params land under force_head/state_proj/*.
+            self.force_head_use_state = bool(config.force_head_use_state)
+            self.force_head = _force_head.build_force_head(
+                pool_mode=self.force_head_pool_mode,
+                cond_dim=paligemma_config.width,
+                n_action_steps=config.action_horizon,
+                force_dim=self.force_head_dim,
+                n_layers=config.force_head_n_layers,
+                n_heads=config.force_head_n_heads,
+                state_dim=(config.action_dim if self.force_head_use_state else None),
+                rngs=rngs,
+            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -237,14 +286,57 @@ class Pi0Faster(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        action_cond = suffix_out[:, -self.action_horizon :]  # (b, ah, action_expert_width) — noisy/time-conditioned
+        v_t = self.action_out_proj(action_cond)
+        # prefix_out is the CLEAN observation conditioning at the image+text
+        # token positions, uncontaminated by suffix noise because the prefix-LM
+        # attention mask blocks prefix queries from attending to suffix keys.
+        # NOTE: state is NOT in prefix_out here (pi05 + discrete_state_input=False
+        # means TokenizePrompt skips state and embed_suffix's state-token branch
+        # is gated on `not self.pi05`). The force head receives state via the
+        # separate state_proj path; see force_head.PerStepForceHead.
+        force_cond = prefix_out  # (b, n_prefix_tokens, paligemma_width)
 
         # Only compute loss where prefix_mask is False (i.e., not in the prefix region).
         # prefix_mask is (b, prefix_len), but v_t and u_t are (b, ah, ad), so we need to broadcast and only select the suffix positions.
         loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # (b, ah)
         postfix_action_mask = jnp.logical_not(prefix_action_mask)  # (b, ah)
-        loss = jnp.sum(loss * postfix_action_mask) / (jnp.sum(postfix_action_mask) + 1e-8)
-        return loss
+        mask_sum = jnp.sum(postfix_action_mask) + 1e-8
+        action_loss = jnp.sum(loss * postfix_action_mask) / mask_sum
+
+        # Auxiliary force-prediction loss (mirrors tactile-diffusion ViT-FMT/DiT).
+        if self.force_head_enabled:
+            if observation.force_target is None:
+                if train:
+                    # Hard fail during training: this would otherwise become a
+                    # silent action-only run with a random force head.
+                    raise ValueError(
+                        "force_head_enabled=True but observation.force_target is None during training. "
+                        "Wire force_target through the data transform pipeline "
+                        "(see TactileForceDataConfig / TactileForceInputs)."
+                    )
+                # eval/inference: allowed to be absent — caller may want only the
+                # action prediction. Skip the force loss term silently.
+            else:
+                # observation.state is the (already-normalized, padded) proprio
+                # input — pass it explicitly so the force head can condition on
+                # hand pose (the LLM does not receive it in pi05 +
+                # discrete_state_input=False).
+                force_state = observation.state if self.force_head_use_state else None
+                force_pred = _force_head.apply_force_head(
+                    self.force_head, force_cond, self.force_head_pool_mode, state=force_state
+                )  # (b, ah, fd)
+                if self.force_head_softplus:
+                    force_pred = nnx.softplus(force_pred)
+                force_target = observation.force_target.astype(force_pred.dtype)
+                if self.force_head_loss_type == "smooth_l1":
+                    per_step_force = _force_head.smooth_l1(force_pred, force_target)  # (b, ah, fd)
+                else:
+                    per_step_force = jnp.square(force_pred - force_target)
+                per_step_force = jnp.mean(per_step_force, axis=-1)  # (b, ah)
+                force_loss = jnp.sum(per_step_force * postfix_action_mask) / mask_sum
+                return action_loss + self.force_loss_weight * force_loss
+        return action_loss
 
     def compute_HAS(
         self, time: jax.Array, delay: jax.Array | None = None, alpha: float = 1.0, u0: float = 0.9

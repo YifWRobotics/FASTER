@@ -43,15 +43,21 @@ class CheckpointWeightLoader(WeightLoader):
         example: "./checkpoints/<config>/<exp>/<step>/params"
       released checkpoints:
         example: "gs://openpi-assets/checkpoints/<model>/params"
+
+    ``missing_regex`` names the model param keys that are allowed to be absent
+    from the checkpoint and kept at their freshly initialized values. The default
+    matches LoRA params (so existing LoRA configs are unchanged). When adding a
+    new submodule on top of a pretrained backbone (e.g. ``force_head/*``), set
+    ``missing_regex`` to include that namespace.
     """
 
     params_path: str
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)
